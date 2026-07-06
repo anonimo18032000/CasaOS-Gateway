@@ -1,8 +1,20 @@
 package service
 
+// TLSState describes the gateway's HTTPS configuration.
+type TLSState struct {
+	Enabled  bool
+	CertFile string
+	KeyFile  string
+	Domain   string
+	Port     string
+}
+
 type State struct {
 	gatewayPort         string
 	onGatewayPortChange []func(string) error
+
+	tls                TLSState
+	onGatewayTLSChange []func(TLSState) error
 
 	runtimePath string
 	wwwPath     string
@@ -12,6 +24,9 @@ func NewState() *State {
 	return &State{
 		gatewayPort:         "",
 		onGatewayPortChange: make([]func(string) error, 0),
+
+		tls:                TLSState{},
+		onGatewayTLSChange: make([]func(TLSState) error, 0),
 
 		runtimePath: "",
 		wwwPath:     "",
@@ -39,6 +54,34 @@ func (c *State) OnGatewayPortChange(f func(string) error) {
 func (c *State) notifyOnGatewayPortChange(port string) error {
 	for i := len(c.onGatewayPortChange) - 1; i >= 0; i-- {
 		if err := c.onGatewayPortChange[i](port); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *State) SetGatewayTLS(tls TLSState) (err error) {
+	defer func() {
+		if err == nil {
+			c.tls = tls
+		}
+	}()
+	return c.notifyOnGatewayTLSChange(tls)
+}
+
+func (c *State) GetGatewayTLS() TLSState {
+	return c.tls
+}
+
+// Add func `f` to the stack. The stack of funcs will be called, in reverse order, when there is a request to change TLS settings.
+func (c *State) OnGatewayTLSChange(f func(TLSState) error) {
+	c.onGatewayTLSChange = append(c.onGatewayTLSChange, f)
+}
+
+func (c *State) notifyOnGatewayTLSChange(tls TLSState) error {
+	for i := len(c.onGatewayTLSChange) - 1; i >= 0; i-- {
+		if err := c.onGatewayTLSChange[i](tls); err != nil {
 			return err
 		}
 	}

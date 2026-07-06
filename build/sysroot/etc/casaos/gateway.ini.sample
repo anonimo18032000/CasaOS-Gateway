@@ -3,3 +3,8 @@ runtimepath=/var/run/casaos
 
 [gateway]
 port=
+tlsenabled=false
+tlscert=
+tlskey=
+tlsdomain=
+tlsport=443

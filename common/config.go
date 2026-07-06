@@ -17,6 +17,12 @@ const (
 	ConfigKeyGatewayPort = "gateway.Port"
 	ConfigKeyRuntimePath = "common.RuntimePath"
 
+	ConfigKeyGatewayTLSEnabled = "gateway.TLSEnabled"
+	ConfigKeyGatewayTLSCert    = "gateway.TLSCert"
+	ConfigKeyGatewayTLSKey     = "gateway.TLSKey"
+	ConfigKeyGatewayTLSDomain  = "gateway.TLSDomain"
+	ConfigKeyGatewayTLSPort    = "gateway.TLSPort"
+
 	GatewayName       = "gateway"
 	GatewayConfigType = "ini"
 )
@@ -29,6 +35,12 @@ func LoadConfig() (*viper.Viper, error) {
 	config.SetDefault(ConfigKeyLogFileExt, "log")
 
 	config.SetDefault(ConfigKeyRuntimePath, constants.DefaultRuntimePath) // See https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch05s13.html
+
+	config.SetDefault(ConfigKeyGatewayTLSEnabled, false)
+	config.SetDefault(ConfigKeyGatewayTLSCert, "")
+	config.SetDefault(ConfigKeyGatewayTLSKey, "")
+	config.SetDefault(ConfigKeyGatewayTLSDomain, "")
+	config.SetDefault(ConfigKeyGatewayTLSPort, "443")
 
 	config.SetConfigName(GatewayName)
 	config.SetConfigType(GatewayConfigType)

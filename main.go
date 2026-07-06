@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"errors"
 	"flag"
@@ -34,8 +35,9 @@ var (
 	commit = "private build"
 	date   = "private build"
 
-	_state   *service.State
-	_gateway *http.Server
+	_state      *service.State
+	_gateway    *http.Server
+	_gatewayTLS *http.Server
 
 	_managementServiceReady = make(chan struct{})
 	_gatewayServiceReady    = make(chan struct{})
@@ -102,6 +104,18 @@ func init() {
 		panic(err)
 	}
 
+	gatewayTLS := service.TLSState{
+		Enabled:  config.GetBool(common.ConfigKeyGatewayTLSEnabled),
+		CertFile: config.GetString(common.ConfigKeyGatewayTLSCert),
+		KeyFile:  config.GetString(common.ConfigKeyGatewayTLSKey),
+		Domain:   config.GetString(common.ConfigKeyGatewayTLSDomain),
+		Port:     config.GetString(common.ConfigKeyGatewayTLSPort),
+	}
+	if err := _state.SetGatewayTLS(gatewayTLS); err != nil {
+		logger.Error("Failed to set gateway TLS state", zap.Any("error", err))
+		panic(err)
+	}
+
 	if err := _state.SetWWWPath(*wwwPathFlag); err != nil {
 		logger.Error("Failed to set www path", zap.Any("error", err), zap.String("wwwpath", *wwwPathFlag))
 		panic(err)
@@ -114,6 +128,15 @@ func init() {
 
 	_state.OnGatewayPortChange(func(port string) error {
 		config.Set(common.ConfigKeyGatewayPort, port)
+		return config.WriteConfig()
+	})
+
+	_state.OnGatewayTLSChange(func(tls service.TLSState) error {
+		config.Set(common.ConfigKeyGatewayTLSEnabled, tls.Enabled)
+		config.Set(common.ConfigKeyGatewayTLSCert, tls.CertFile)
+		config.Set(common.ConfigKeyGatewayTLSKey, tls.KeyFile)
+		config.Set(common.ConfigKeyGatewayTLSDomain, tls.Domain)
+		config.Set(common.ConfigKeyGatewayTLSPort, tls.Port)
 		return config.WriteConfig()
 	})
 }
@@ -134,6 +157,11 @@ func main() {
 		if _gateway != nil {
 			if err := _gateway.Shutdown(context.Background()); err != nil {
 				logger.Error("Failed to stop gateway", zap.Any("error", err))
+			}
+		}
+		if _gatewayTLS != nil {
+			if err := _gatewayTLS.Shutdown(context.Background()); err != nil {
+				logger.Error("Failed to stop HTTPS gateway", zap.Any("error", err))
 			}
 		}
 	}()
@@ -221,6 +249,13 @@ func run(
 					return err
 				}
 
+				if err := management.CreateRoute(&model.Route{
+					Path:   "/v1/gateway/https",
+					Target: "http://" + listener.Addr().String(),
+				}); err != nil {
+					return err
+				}
+
 				_managementServiceReady <- struct{}{}
 
 				return nil
@@ -273,6 +308,16 @@ func run(
 
 				if err := reloadGateway(_state.GetGatewayPort(), route); err != nil {
 					return err
+				}
+
+				_state.OnGatewayTLSChange(func(tlsState service.TLSState) error {
+					return reloadGatewayForTLS(tlsState, route)
+				})
+
+				if _state.GetGatewayTLS().Enabled {
+					if err := reloadGatewayForTLS(_state.GetGatewayTLS(), route); err != nil {
+						logger.Error("Failed to enable HTTPS on startup - falling back to HTTP only", zap.Any("error", err))
+					}
 				}
 
 				_gatewayServiceReady <- struct{}{}
@@ -372,6 +417,199 @@ func reloadGateway(port string, route *http.ServeMux) error {
 	_gateway = gatewayNew
 
 	return nil
+}
+
+// reloadGatewayForTLS enables or disables HTTPS. When enabling, the app is served over TLS on
+// tlsState.Port and the existing plain-HTTP gateway port is repurposed to redirect to HTTPS.
+// When disabling, the HTTPS listener is torn down and the plain-HTTP gateway goes back to
+// serving the app directly.
+func reloadGatewayForTLS(tlsState service.TLSState, route *http.ServeMux) error {
+	if !tlsState.Enabled {
+		stopServer(&_gatewayTLS)
+		scheduleForceSetGatewayHandler(_state.GetGatewayPort(), route)
+		return nil
+	}
+
+	cert, err := tls.LoadX509KeyPair(tlsState.CertFile, tlsState.KeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS certificate: %w", err)
+	}
+
+	tlsPort := tlsState.Port
+	if tlsPort == "" {
+		tlsPort = "443"
+	}
+
+	tlsListener, err := tls.Listen("tcp", net.JoinHostPort("", tlsPort), &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to listen on HTTPS port %s: %w", tlsPort, err)
+	}
+
+	gatewayNewTLS := &http.Server{
+		Addr:              tlsListener.Addr().String(),
+		Handler:           route,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		if err := gatewayNewTLS.Serve(tlsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("Error when serving HTTPS gateway", zap.Any("error", err), zap.Any("address", gatewayNewTLS.Addr))
+		}
+	}()
+
+	// the certificate is (or may be) self-signed, so this internal loopback health check
+	// cannot rely on normal certificate validation.
+	if err := checkTLSURLWithRetry("https://127.0.0.1:"+tlsPort+"/ping", 10); err != nil {
+		_ = gatewayNewTLS.Close()
+		return err
+	}
+
+	logger.Info("HTTPS gateway is listening...", zap.Any("address", gatewayNewTLS.Addr))
+
+	stopServer(&_gatewayTLS)
+	_gatewayTLS = gatewayNewTLS
+
+	redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ping" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("pong"))
+			return
+		}
+
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+
+		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
+	})
+
+	// This request may itself be arriving through the very plain-HTTP gateway we're about to
+	// tear down and rebuild on the same port (e.g. the initial "enable HTTPS" call always comes
+	// in over plain HTTP, since HTTPS doesn't exist yet). Shutting that server down synchronously
+	// from within its own in-flight request would deadlock, since Shutdown waits for active
+	// connections - including this one - to finish. Doing the swap shortly after we return avoids
+	// that self-wait.
+	scheduleForceSetGatewayHandler(_state.GetGatewayPort(), redirectHandler)
+
+	return nil
+}
+
+// scheduleForceSetGatewayHandler runs forceSetGatewayHandler shortly after returning, so it never
+// blocks (or deadlocks on) the request that triggered it.
+func scheduleForceSetGatewayHandler(port string, handler http.Handler) {
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		if err := forceSetGatewayHandler(port, handler); err != nil {
+			logger.Error("Failed to swap plain-HTTP gateway handler", zap.Any("error", err), zap.Any("port", port))
+		}
+	}()
+}
+
+// forceSetGatewayHandler replaces whatever is currently serving on `port` with `handler`, even if
+// a server is already bound to that same address (unlike reloadGateway, which skips the swap in
+// that case). This is needed to switch the plain-HTTP gateway between serving the app directly
+// and redirecting to HTTPS, without changing its port. Since the address doesn't change, the old
+// server has to be shut down *before* binding the new listener - reloadGateway's overlap-then-
+// retire approach doesn't work when both listeners want the same port.
+func forceSetGatewayHandler(port string, handler http.Handler) error {
+	if _gateway != nil {
+		if err := _gateway.Shutdown(context.Background()); err != nil {
+			logger.Error("Error when stopping previous gateway", zap.Any("error", err), zap.Any("address", _gateway.Addr))
+		}
+		_gateway = nil
+	}
+
+	listener, err := net.Listen("tcp", net.JoinHostPort("", port))
+	if err != nil {
+		return err
+	}
+
+	addr := listener.Addr().String()
+
+	gatewayNew := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		err := gatewayNew.Serve(listener)
+		if err != nil {
+			if errors.Is(err, http.ErrServerClosed) {
+				logger.Info("A gateway is stopped", zap.Any("address", gatewayNew.Addr))
+				return
+			}
+			logger.Error("Error when serving a gateway", zap.Any("error", err), zap.Any("address", gatewayNew.Addr))
+		}
+	}()
+
+	if err := checkURLWithRetry("http://"+addr+"/ping", 10); err != nil {
+		return err
+	}
+
+	logger.Info("New gateway is listening...", zap.Any("address", gatewayNew.Addr))
+
+	_gateway = gatewayNew
+
+	return nil
+}
+
+// stopServer gracefully shuts down *server (if any) after a short delay and clears the pointer.
+func stopServer(server **http.Server) {
+	if *server == nil {
+		return
+	}
+
+	old := *server
+	*server = nil
+
+	go func() {
+		time.Sleep(time.Second) // so that any in-flight request gets a response
+		if err := old.Shutdown(context.Background()); err != nil {
+			logger.Error("Error when stopping server", zap.Any("error", err), zap.Any("address", old.Addr))
+		}
+	}()
+}
+
+// checkTLSURLWithRetry is like checkURLWithRetry but skips certificate verification, since it is
+// only ever used to probe our own freshly generated/uploaded certificate on the loopback address.
+func checkTLSURLWithRetry(url string, retry uint) error {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // loopback self-check only
+		},
+	}
+
+	count := retry
+	var err error
+
+	for count >= 0 {
+		logger.Info("Checking if HTTPS service at URL is running...", zap.Any("url", url), zap.Any("retry", count))
+
+		var resp *http.Response
+		resp, err = client.Get(url)
+		if err != nil {
+			time.Sleep(time.Second)
+			count--
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			return nil
+		}
+
+		err = ErrCheckURLNotOK
+		time.Sleep(time.Second)
+		count--
+	}
+
+	return err
 }
 
 func checkURLWithRetry(url string, retry uint) error {

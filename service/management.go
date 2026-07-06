@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/IceWhaleTech/CasaOS-Common/model"
+	"github.com/IceWhaleTech/CasaOS-Common/utils/constants"
 	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 	"go.uber.org/zap"
 )
@@ -106,6 +107,70 @@ func (g *Management) SetGatewayPort(port string) error {
 	}
 
 	return nil
+}
+
+// CertificateDir returns the directory where generated/uploaded HTTPS certificates are stored.
+func (g *Management) CertificateDir() string {
+	return filepath.Join(constants.DefaultDataPath, "certificates")
+}
+
+func (g *Management) GetGatewayTLS() TLSState {
+	return g.State.GetGatewayTLS()
+}
+
+// GenerateHTTPSCertificate generates a self-signed certificate for the given domain and enables HTTPS.
+func (g *Management) GenerateHTTPSCertificate(domain string) error {
+	certDir := g.CertificateDir()
+	if err := os.MkdirAll(certDir, 0o755); err != nil {
+		return err
+	}
+
+	certPath := filepath.Join(certDir, "cert.pem")
+	keyPath := filepath.Join(certDir, "key.pem")
+
+	if err := GenerateSelfSignedCertificate(domain, certPath, keyPath); err != nil {
+		return err
+	}
+
+	current := g.State.GetGatewayTLS()
+	current.Enabled = true
+	current.CertFile = certPath
+	current.KeyFile = keyPath
+	current.Domain = domain
+
+	return g.State.SetGatewayTLS(current)
+}
+
+// UploadHTTPSCertificate validates and stores a user-provided certificate/key pair and enables HTTPS.
+func (g *Management) UploadHTTPSCertificate(certPEM []byte, keyPEM []byte) error {
+	certDir := g.CertificateDir()
+	if err := os.MkdirAll(certDir, 0o755); err != nil {
+		return err
+	}
+
+	certPath := filepath.Join(certDir, "cert.pem")
+	keyPath := filepath.Join(certDir, "key.pem")
+
+	domain, err := ValidateAndSaveCertificate(certPEM, keyPEM, certPath, keyPath)
+	if err != nil {
+		return err
+	}
+
+	current := g.State.GetGatewayTLS()
+	current.Enabled = true
+	current.CertFile = certPath
+	current.KeyFile = keyPath
+	current.Domain = domain
+
+	return g.State.SetGatewayTLS(current)
+}
+
+// DisableHTTPS turns HTTPS off. The certificate files are left on disk so re-enabling doesn't require regenerating them.
+func (g *Management) DisableHTTPS() error {
+	current := g.State.GetGatewayTLS()
+	current.Enabled = false
+
+	return g.State.SetGatewayTLS(current)
 }
 
 func getSortedKeys[V any](m map[string]V) []string {
