@@ -2,15 +2,15 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/IceWhaleTech/CasaOS-Gateway.svg)](https://pkg.go.dev/github.com/IceWhaleTech/CasaOS-Gateway) [![Go Report Card](https://goreportcard.com/badge/github.com/IceWhaleTech/CasaOS-Gateway)](https://goreportcard.com/report/github.com/IceWhaleTech/CasaOS-Gateway) [![goreleaser](https://github.com/IceWhaleTech/CasaOS-Gateway/actions/workflows/release.yml/badge.svg)](https://github.com/IceWhaleTech/CasaOS-Gateway/actions/workflows/release.yml) [![codecov](https://codecov.io/gh/IceWhaleTech/CasaOS-Gateway/branch/main/graph/badge.svg?token=5JIHXF1RJ4)](https://codecov.io/gh/IceWhaleTech/CasaOS-Gateway)
 
-CasaOS Gateway is a dynamic API gateway service that can be used to expose APIs from different other HTTP based services.
+O CasaOS Gateway é um serviço de gateway de API dinâmico que pode ser usado para expor APIs de diversos outros serviços baseados em HTTP.
 
-This gateway service comes with a simple management API for other services to register their APIs by route paths. A HTTP request arrived at gateway port will be forwarded to the service that is registered for the route path.
+Este serviço de gateway vem com uma API de gerenciamento simples para que outros serviços registrem suas APIs por caminhos de rota. Uma requisição HTTP que chegar na porta do gateway será encaminhada para o serviço registrado naquele caminho de rota.
 
-> As a best practice, a service behind this gateway should bind to localhost (`127.0.0.1` for IPv4, `::1` for IPv6) ONLY, so no external network access is allowed.
+> Como boa prática, um serviço atrás deste gateway deve se vincular APENAS ao localhost (`127.0.0.1` para IPv4, `::1` para IPv6), de forma que nenhum acesso externo pela rede seja permitido.
 
-## Configuration
+## Configuração
 
-Upon launching, it will search for `gateway.ini` file in the following order:
+Ao iniciar, ele vai procurar pelo arquivo `gateway.ini` na seguinte ordem:
 
 ```bash
 ./gateway.ini
@@ -19,29 +19,29 @@ $HOME/.casaos/gateway.ini
 /etc/casaos/gateway.ini
 ```
 
-See [gateway.ini.sample](./build/etc/casaos/gateway.ini.sample) for default configuration.
+Veja [gateway.ini.sample](./build/etc/casaos/gateway.ini.sample) para a configuração padrão.
 
-## Running
+## Execução
 
-Once running, gateway address and management address will be available in the files under `RuntimePath`  specified in configuration.
+Uma vez em execução, o endereço do gateway e o endereço de gerenciamento estarão disponíveis nos arquivos dentro do `RuntimePath` especificado na configuração.
 
 ```bash
 $ cat /var/run/casaos/gateway.url 
-[::]:8080 # port is specified in configuration
+[::]:8080 # a porta é especificada na configuração
 
 $ cat /var/run/casaos/management.url 
-[::]:34703 # port is randomly assigned
+[::]:34703 # a porta é atribuída aleatoriamente
 ```
 
-## Example
+## Exemplo
 
-Assuming that
+Supondo que
 
-- the management API is running on port `34703`
-- the gateway is running on port `8080`
-- some API running at `http://localhost:12345/ping` that simply returns `pong`.
+- a API de gerenciamento está rodando na porta `34703`
+- o gateway está rodando na porta `8080`
+- alguma API rodando em `http://localhost:12345/ping` que simplesmente retorna `pong`.
 
-Then register the API as follows:
+Registre a API da seguinte forma:
 
 - POST `http://localhost:34703/v1/gateway/routes`
 
@@ -52,7 +52,7 @@ Then register the API as follows:
   }
   ```
 
-  or in command line:
+  ou pela linha de comando:
 
   ```bash
   $ curl 'localhost:34703/v1/gateway/routes' --data-raw '
@@ -60,14 +60,14 @@ Then register the API as follows:
     '
   ```
 
-Now run
+Agora execute
 
 ```bash
 $ curl localhost:8080/ping
 {"message":"pong"}
 ```
 
-... which is equivalent as
+... o que é equivalente a
 
 ```bash
 $ curl localhost:12345/ping
