@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,6 +39,9 @@ var (
 	_state      *service.State
 	_gateway    *http.Server
 	_gatewayTLS *http.Server
+
+	// _gatewayMu guards _gateway and _gatewayTLS, which are swapped from request/timer goroutines.
+	_gatewayMu sync.Mutex
 
 	_managementServiceReady = make(chan struct{})
 	_gatewayServiceReady    = make(chan struct{})
@@ -154,13 +158,17 @@ func main() {
 	)
 
 	defer func() {
-		if _gateway != nil {
-			if err := _gateway.Shutdown(context.Background()); err != nil {
+		_gatewayMu.Lock()
+		gateway, gatewayTLS := _gateway, _gatewayTLS
+		_gatewayMu.Unlock()
+
+		if gateway != nil {
+			if err := gateway.Shutdown(context.Background()); err != nil {
 				logger.Error("Failed to stop gateway", zap.Any("error", err))
 			}
 		}
-		if _gatewayTLS != nil {
-			if err := _gatewayTLS.Shutdown(context.Background()); err != nil {
+		if gatewayTLS != nil {
+			if err := gatewayTLS.Shutdown(context.Background()); err != nil {
 				logger.Error("Failed to stop HTTPS gateway", zap.Any("error", err))
 			}
 		}
@@ -371,7 +379,11 @@ func reloadGateway(port string, route *http.ServeMux) error {
 
 	addr := listener.Addr().String()
 
-	if _gateway != nil && _gateway.Addr == addr {
+	_gatewayMu.Lock()
+	current := _gateway
+	_gatewayMu.Unlock()
+
+	if current != nil && current.Addr == addr {
 		logger.Info("Port is the same as current running gateway - no change is required")
 		return nil
 	}
@@ -403,8 +415,12 @@ func reloadGateway(port string, route *http.ServeMux) error {
 	logger.Info("New gateway is listening...", zap.Any("address", gatewayNew.Addr))
 
 	// stop old gateway
-	if _gateway != nil {
-		gatewayOld := _gateway
+	_gatewayMu.Lock()
+	gatewayOld := _gateway
+	_gateway = gatewayNew
+	_gatewayMu.Unlock()
+
+	if gatewayOld != nil {
 		go func() {
 			logger.Info("Stopping previous gateway in 1 seconds...", zap.Any("address", gatewayOld.Addr))
 			time.Sleep(time.Second) // so that any request to the old gateway gets a response
@@ -413,8 +429,6 @@ func reloadGateway(port string, route *http.ServeMux) error {
 			}
 		}()
 	}
-
-	_gateway = gatewayNew
 
 	return nil
 }
@@ -470,7 +484,9 @@ func reloadGatewayForTLS(tlsState service.TLSState, route *http.ServeMux) error 
 	logger.Info("HTTPS gateway is listening...", zap.Any("address", gatewayNewTLS.Addr))
 
 	stopServer(&_gatewayTLS)
+	_gatewayMu.Lock()
 	_gatewayTLS = gatewayNewTLS
+	_gatewayMu.Unlock()
 
 	redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/ping" {
@@ -479,12 +495,7 @@ func reloadGatewayForTLS(tlsState service.TLSState, route *http.ServeMux) error 
 			return
 		}
 
-		host := r.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-
-		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
+		http.Redirect(w, r, service.HTTPSRedirectURL(r.Host, tlsPort, r.URL.RequestURI()), http.StatusMovedPermanently)
 	})
 
 	// This request may itself be arriving through the very plain-HTTP gateway we're about to
@@ -516,11 +527,15 @@ func scheduleForceSetGatewayHandler(port string, handler http.Handler) {
 // server has to be shut down *before* binding the new listener - reloadGateway's overlap-then-
 // retire approach doesn't work when both listeners want the same port.
 func forceSetGatewayHandler(port string, handler http.Handler) error {
-	if _gateway != nil {
-		if err := _gateway.Shutdown(context.Background()); err != nil {
-			logger.Error("Error when stopping previous gateway", zap.Any("error", err), zap.Any("address", _gateway.Addr))
+	_gatewayMu.Lock()
+	previous := _gateway
+	_gateway = nil
+	_gatewayMu.Unlock()
+
+	if previous != nil {
+		if err := previous.Shutdown(context.Background()); err != nil {
+			logger.Error("Error when stopping previous gateway", zap.Any("error", err), zap.Any("address", previous.Addr))
 		}
-		_gateway = nil
 	}
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("", port))
@@ -553,19 +568,23 @@ func forceSetGatewayHandler(port string, handler http.Handler) error {
 
 	logger.Info("New gateway is listening...", zap.Any("address", gatewayNew.Addr))
 
+	_gatewayMu.Lock()
 	_gateway = gatewayNew
+	_gatewayMu.Unlock()
 
 	return nil
 }
 
 // stopServer gracefully shuts down *server (if any) after a short delay and clears the pointer.
 func stopServer(server **http.Server) {
-	if *server == nil {
-		return
-	}
-
+	_gatewayMu.Lock()
 	old := *server
 	*server = nil
+	_gatewayMu.Unlock()
+
+	if old == nil {
+		return
+	}
 
 	go func() {
 		time.Sleep(time.Second) // so that any in-flight request gets a response
@@ -585,17 +604,15 @@ func checkTLSURLWithRetry(url string, retry uint) error {
 		},
 	}
 
-	count := retry
 	var err error
 
-	for count >= 0 {
+	for count := int(retry); count >= 0; count-- {
 		logger.Info("Checking if HTTPS service at URL is running...", zap.Any("url", url), zap.Any("retry", count))
 
 		var resp *http.Response
 		resp, err = client.Get(url)
 		if err != nil {
 			time.Sleep(time.Second)
-			count--
 			continue
 		}
 		resp.Body.Close()
@@ -606,21 +623,18 @@ func checkTLSURLWithRetry(url string, retry uint) error {
 
 		err = ErrCheckURLNotOK
 		time.Sleep(time.Second)
-		count--
 	}
 
 	return err
 }
 
 func checkURLWithRetry(url string, retry uint) error {
-	count := retry
 	var err error
 
-	for count >= 0 {
+	for count := int(retry); count >= 0; count-- {
 		logger.Info("Checking if service at URL is running...", zap.Any("url", url), zap.Any("retry", count))
 		if err = checkURL(url); err != nil {
 			time.Sleep(time.Second)
-			count--
 			continue
 		}
 		break
@@ -631,12 +645,12 @@ func checkURLWithRetry(url string, retry uint) error {
 
 func checkURL(url string) error {
 	response, err := http2.Get(url, 5*time.Second)
-	if err == nil {
+	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
 
-	if response.StatusCode == http.StatusOK {
+	if response.StatusCode != http.StatusOK {
 		return ErrCheckURLNotOK
 	}
 
